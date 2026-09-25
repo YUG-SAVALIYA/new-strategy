@@ -96,6 +96,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Advanced Filters")
 min_simul_signals = st.sidebar.number_input("Min Signals Per Day", min_value=1, value=1, help="Only take trades if at least this many stocks trigger on the same day.")
 skip_friday_entries = st.sidebar.checkbox("Skip Friday Entries", value=False, help="Do not buy stocks on Fridays to avoid weekend gap risk.")
+min_market_cap = st.sidebar.number_input("Min Market Cap (₹ Crores)", min_value=0, value=8000, help="Ignore stocks below this market cap.")
 
 mr_mult = 1.0 - (mr_threshold_pct / 100.0)
 alloc_frac = alloc_pct / 100.0
@@ -104,7 +105,9 @@ slippage_frac = slippage_pct / 100.0
 
 @st.cache_data
 def load_data(data_dir):
-    files = glob.glob(os.path.join(data_dir, "*_Day.parquet"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    full_data_dir = os.path.join(script_dir, data_dir)
+    files = glob.glob(os.path.join(full_data_dir, "*_Day.parquet"))
     dfs = {}
     for f in files:
         symbol = os.path.basename(f).replace("_Day.parquet", "")
@@ -113,8 +116,26 @@ def load_data(data_dir):
         dfs[symbol] = df.sort_values('datetime').reset_index(drop=True)
     return dfs
 
+@st.cache_data
+def load_market_cap():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, "Average Market cap.xlsx")
+    if not os.path.exists(file_path):
+        return {}
+    df = pd.read_excel(file_path)
+    col = [c for c in df.columns if 'Average market capitalisation' in c]
+    if not col: return {}
+    col = col[0]
+    df = df.dropna(subset=[col, 'Symbol'])
+    return {str(row['Symbol']).strip(): float(row[col]) / 100.0 for _, row in df.iterrows()}
+
 with st.spinner("Loading Data..."):
     data_dict = load_data('groww_data')
+    mcap_dict = load_market_cap()
+
+if not data_dict:
+    st.error("⚠️ No data files found! Please ensure your `.parquet` data files are placed in the `groww_data/` folder.")
+    st.stop()
 
 # Build trading calendar
 all_dates = pd.Series(pd.concat([df['datetime'] for df in data_dict.values()]).unique()).sort_values().reset_index(drop=True)
@@ -186,11 +207,13 @@ def verify_reconciliation(df_ledger, df_trades, open_positions):
     return errors
 
 @st.cache_data
-def precompute_signals(sma_p, mr_thresh, s_date, e_date, cal_list):
+def precompute_signals(sma_p, mr_thresh, min_mcap, s_date, e_date, cal_list):
     mr_m = 1.0 - (mr_thresh / 100.0)
     sig_by_date = {d: [] for d in cal_list}
     lookback = int(sma_p) * 2 + 50
     for sym, df in data_dict.items():
+        if mcap_dict.get(sym, 0) < min_mcap: continue
+        
         df_sub = df[(df['datetime'] >= pd.to_datetime(s_date) - pd.Timedelta(days=lookback)) & (df['datetime'] <= pd.to_datetime(e_date))]
         if df_sub.empty: continue
         
@@ -203,6 +226,7 @@ def precompute_signals(sma_p, mr_thresh, s_date, e_date, cal_list):
         
         cond1 = df_sub['close_prev'] <= df_sub['thresh_prev']
         cond2 = df_sub['close'] > df_sub['close_prev']
+        
         df_sub['signal'] = cond1 & cond2
         
         sig_dates = df_sub[df_sub['signal']]['datetime'].tolist()
@@ -222,7 +246,7 @@ def precompute_price_lookup(s_date, e_date):
     return p_lookup
 
 def run_simulation():
-    signals_by_date = precompute_signals(sma_period, mr_threshold_pct, start_date, end_date, calendar_list)
+    signals_by_date = precompute_signals(sma_period, mr_threshold_pct, min_market_cap, start_date, end_date, calendar_list)
     price_lookup = precompute_price_lookup(start_date, end_date)
 
     cash = init_capital
@@ -678,7 +702,8 @@ with tab_backtest:
                     'sma_period': sma_period, 'mr_threshold_pct': mr_threshold_pct, 'hold_period': hold_period,
                     'alloc_pct': alloc_pct, 'max_positions': max_positions, 'fees_pct': fees_pct, 'slippage_pct': slippage_pct,
                     'use_initial_sl': use_initial_sl, 'initial_sl_pct': initial_sl_pct,
-                    'enabled_stages': enabled_stages, 'min_simul_signals': min_simul_signals, 'skip_friday': skip_friday_entries
+                    'enabled_stages': enabled_stages, 'min_simul_signals': min_simul_signals, 'skip_friday': skip_friday_entries,
+                    'min_market_cap': min_market_cap
                 }
             }
 
