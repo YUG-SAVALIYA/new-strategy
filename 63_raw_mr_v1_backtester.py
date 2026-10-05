@@ -18,10 +18,10 @@ st.title("RAW MR V1 Research Platform")
 
 # --- Initialize Session State ---
 default_stages_df = pd.DataFrame({
-    'Enable': [True, True, True],
-    'Trigger %': [5.0, 10.0, 20.0],
-    'Sell Qty %': [0.0, 25.0, 50.0],
-    'New SL %': [0.0, 3.0, 10.0]
+    'Enable': [True, True, True, True],
+    'Trigger %': [2.0, 5.0, 12.0, 20.0],
+    'Sell Qty %': [0.0, 0.0, 25.0, 75.0],
+    'New SL %': [0.5, 3.0, 10.0, 12.0]
 })
 
 SAVE_DIR = "saved_runs"
@@ -41,17 +41,18 @@ if 'saved_runs' not in st.session_state:
 
 if 'init_capital' not in st.session_state:
     st.session_state.update({
-        'init_capital': 1000000,
+        'init_capital': 100000,
         'start_date': pd.to_datetime('2015-01-01').date(),
         'end_date': pd.to_datetime('2026-01-01').date(),
-        'sma_period': 20,
-        'mr_threshold_pct': 25.0,
+        'sma_period': 60,
+        'mr_threshold_pct': 40.0,
         'hold_period': 20,
-        'alloc_pct': 10.0,
-        'max_positions': 10,
+        'leverage': 4.0,
+        'alloc_pct': 12.0,
+        'max_positions': 6,
         'fees_pct': 0.05,
         'slippage_pct': 0.05,
-        'use_initial_sl': False,
+        'use_initial_sl': True,
         'initial_sl_pct': -5.0,
         'editor_key_counter': 0
     })
@@ -62,6 +63,7 @@ def load_frozen_preset():
         'mr_threshold_pct': 25.0,
         'hold_period': 20,
         'use_initial_sl': False,
+        'allow_duplicate_symbols': True,
         'editor_key_counter': st.session_state.get('editor_key_counter', 0) + 1
     })
 
@@ -77,8 +79,10 @@ mr_threshold_pct = st.sidebar.number_input("Mean-Reversion Threshold %", key='mr
 hold_period = st.sidebar.number_input("Holding Period (days)", key='hold_period', step=1)
 
 st.sidebar.header("Portfolio Parameters")
-alloc_pct = st.sidebar.number_input("Allocation % of Available Cash", key='alloc_pct')
+leverage = st.sidebar.number_input("Leverage (x)", min_value=1.0, max_value=10.0, step=0.5, key='leverage', help="Multiplier for buying power. 1.0 means no leverage.")
+alloc_pct = st.sidebar.number_input("Allocation % of Total Equity", key='alloc_pct')
 max_positions = st.sidebar.number_input("Maximum Concurrent Positions", key='max_positions', step=1)
+allow_duplicate_symbols = st.sidebar.checkbox("Allow Duplicate Symbols (Pyramiding)", key='allow_duplicate_symbols', help="If checked, the system can buy a stock even if it is already held in an open position.", value=True)
 fees_pct = st.sidebar.number_input("Fees %", key='fees_pct')
 slippage_pct = st.sidebar.number_input("Slippage %", key='slippage_pct')
 
@@ -95,8 +99,20 @@ enabled_stages = edited_stages[edited_stages['Enable'] == True].sort_values('Tri
 st.sidebar.markdown("---")
 st.sidebar.subheader("Advanced Filters")
 min_simul_signals = st.sidebar.number_input("Min Signals Per Day", min_value=1, value=1, help="Only take trades if at least this many stocks trigger on the same day.")
-skip_friday_entries = st.sidebar.checkbox("Skip Friday Entries", value=False, help="Do not buy stocks on Fridays to avoid weekend gap risk.")
-min_market_cap = st.sidebar.number_input("Min Market Cap (₹ Crores)", min_value=0, value=8000, help="Ignore stocks below this market cap.")
+skip_friday_entries = st.sidebar.checkbox("Skip Friday Entries", value=True, help="Do not buy stocks on Fridays to avoid weekend gap risk.")
+min_market_cap = st.sidebar.number_input("Min Market Cap (₹ Crores)", min_value=0, value=5000, help="Ignore stocks below this market cap.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Technical Signal Filters")
+min_red_days = st.sidebar.number_input("Min Consecutive Red Days", min_value=0, max_value=10, value=0, help="Require this many consecutive down days before the bounce. 0 disables this filter.")
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    min_vol_surge = st.number_input("Min Vol Surge", min_value=1.0, max_value=5.0, value=1.0, step=0.1, help="Require the bounce day to have volume this many times higher than its average. 1.0 disables this filter.")
+with col2:
+    vol_sma_days = st.number_input("Vol Avg Days", min_value=5, max_value=50, value=20, step=1, help="Number of days for the volume average.")
+max_rsi14 = st.sidebar.number_input("Max RSI(14) on Bounce", min_value=10, max_value=100, value=100, help="Reject the trade if the 14-day RSI is above this value on the signal day. 100 disables this filter (recommended: 25).")
+min_body_pct = st.sidebar.number_input("Min Candle Body %", min_value=0.0, max_value=20.0, value=0.0, step=0.5, help="Only take trades where the signal day candle has a green body at least this % big. 0.0 disables this filter (recommended: 1.0).")
+min_range_pct = st.sidebar.number_input("Min Candle Range %", min_value=0.0, max_value=50.0, value=2.0, step=0.5, help="Only take trades where the signal day candle has a high-to-low range of at least this %. 0.0 disables this filter.")
 
 mr_mult = 1.0 - (mr_threshold_pct / 100.0)
 alloc_frac = alloc_pct / 100.0
@@ -126,6 +142,7 @@ def load_market_cap():
     col = [c for c in df.columns if 'Average market capitalisation' in c]
     if not col: return {}
     col = col[0]
+    df[col] = pd.to_numeric(df[col], errors='coerce')
     df = df.dropna(subset=[col, 'Symbol'])
     return {str(row['Symbol']).strip(): float(row[col]) / 100.0 for _, row in df.iterrows()}
 
@@ -207,7 +224,7 @@ def verify_reconciliation(df_ledger, df_trades, open_positions):
     return errors
 
 @st.cache_data
-def precompute_signals(sma_p, mr_thresh, min_mcap, s_date, e_date, cal_list):
+def precompute_signals(sma_p, mr_thresh, min_mcap, min_r_days, min_v_surge, vol_sma_days, max_rsi, min_body, min_range, s_date, e_date, cal_list):
     mr_m = 1.0 - (mr_thresh / 100.0)
     sig_by_date = {d: [] for d in cal_list}
     lookback = int(sma_p) * 2 + 50
@@ -227,7 +244,42 @@ def precompute_signals(sma_p, mr_thresh, min_mcap, s_date, e_date, cal_list):
         cond1 = df_sub['close_prev'] <= df_sub['thresh_prev']
         cond2 = df_sub['close'] > df_sub['close_prev']
         
-        df_sub['signal'] = cond1 & cond2
+        if min_r_days > 0:
+            is_red = df_sub['close'] < df_sub['close_prev']
+            red_streak = is_red.rolling(int(min_r_days)).sum() == int(min_r_days)
+            cond3 = red_streak.shift(1).fillna(False)
+        else:
+            cond3 = True
+            
+        if min_v_surge > 1.0:
+            df_sub['vol_sma_dyn'] = df_sub['volume'].rolling(int(vol_sma_days)).mean()
+            cond4 = df_sub['volume'] >= (df_sub['vol_sma_dyn'] * min_v_surge)
+        else:
+            cond4 = True
+            
+        if max_rsi < 100:
+            delta = df_sub['close'].diff()
+            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = gain / loss
+            df_sub['rsi14'] = 100 - (100 / (1 + rs))
+            cond5 = df_sub['rsi14'] <= max_rsi
+        else:
+            cond5 = True
+        
+        if min_body > 0:
+            df_sub['body_pct'] = ((df_sub['close'] - df_sub['open']) / df_sub['open']) * 100
+            cond6 = df_sub['body_pct'] >= min_body
+        else:
+            cond6 = True
+            
+        if min_range > 0:
+            df_sub['range_pct'] = ((df_sub['high'] - df_sub['low']) / df_sub['low']) * 100
+            cond7 = df_sub['range_pct'] >= min_range
+        else:
+            cond7 = True
+        
+        df_sub['signal'] = cond1 & cond2 & cond3 & cond4 & cond5 & cond6 & cond7
         
         sig_dates = df_sub[df_sub['signal']]['datetime'].tolist()
         for d in sig_dates:
@@ -246,7 +298,7 @@ def precompute_price_lookup(s_date, e_date):
     return p_lookup
 
 def run_simulation():
-    signals_by_date = precompute_signals(sma_period, mr_threshold_pct, min_market_cap, start_date, end_date, calendar_list)
+    signals_by_date = precompute_signals(sma_period, mr_threshold_pct, min_market_cap, min_red_days, min_vol_surge, vol_sma_days, max_rsi14, min_body_pct, min_range_pct, start_date, end_date, calendar_list)
     price_lookup = precompute_price_lookup(start_date, end_date)
 
     cash = init_capital
@@ -281,13 +333,19 @@ def run_simulation():
             
             for sym in signals:
                 if len(open_positions) >= int(max_positions): break
+                
+                if not allow_duplicate_symbols:
+                    if any(pos['symbol'] == sym for pos in open_positions):
+                        continue
                     
                 if sym in price_lookup and current_date in price_lookup[sym]:
                     today_prices = price_lookup[sym][current_date]
                     entry_price = today_prices['open']
                     
-                    ideal_alloc = sod_equity * alloc_frac
-                    alloc = min(ideal_alloc, cash)
+                    ideal_alloc = (sod_equity * alloc_frac) * leverage
+                    buying_power = max(0.0, (sod_equity * leverage) - sod_deployed)
+                    max_alloc_with_fees = buying_power / (1 + fees_frac + slippage_frac)
+                    alloc = min(ideal_alloc, max_alloc_with_fees)
                     qty = math.floor(alloc / entry_price)
                     
                     if qty > 0:
@@ -296,7 +354,7 @@ def run_simulation():
                         slip = investment * slippage_frac
                         total_cost = investment + fee + slip
                         
-                        if cash >= total_cost:
+                        if total_cost <= buying_power + 1e-5:
                             cash -= total_cost
                             daily_entry_fees += fee
                             daily_entry_slip += slip
@@ -578,6 +636,11 @@ with tab_backtest:
             df_ledger['Drawdown ₹'] = df_ledger['High Water Mark'] - df_ledger['Total Equity']
             df_ledger['Drawdown %'] = (df_ledger['Drawdown ₹'] / df_ledger['High Water Mark']) * 100
             
+            df_ledger['Realized Equity'] = df_ledger['Available Cash'] + df_ledger['Deployed Capital']
+            df_ledger['Realized HWM'] = df_ledger['Realized Equity'].cummax()
+            df_ledger['Realized DD ₹'] = df_ledger['Realized HWM'] - df_ledger['Realized Equity']
+            df_ledger['Realized DD %'] = (df_ledger['Realized DD ₹'] / df_ledger['Realized HWM']) * 100
+            
             # Add Cumulative Metrics
             df_ledger['Cum Wins'] = df_ledger['Wins'].cumsum()
             df_ledger['Cum Losses'] = df_ledger['Losses'].cumsum()
@@ -601,6 +664,7 @@ with tab_backtest:
                     Closing_Equity=('Total Equity', 'last'),
                     Net_PnL=('Net Daily P&L', 'sum'),
                     Max_DD=('Drawdown %', 'max'),
+                    Max_Realized_DD=('Realized DD %', 'max'),
                     Fees_Total=('Fees', 'sum'),
                     Slippage_Total=('Slippage', 'sum')
                 ).reset_index()
@@ -670,6 +734,9 @@ with tab_backtest:
             max_dd_pct = df_ledger['Drawdown %'].max()
             max_dd_rs = df_ledger['Drawdown ₹'].max()
             
+            max_real_dd_pct = df_ledger['Realized DD %'].max()
+            max_real_dd_rs = df_ledger['Realized DD ₹'].max()
+            
             # --- Store Current Run in Session State ---
             kpis = {
                 'Final Capital': final_cap,
@@ -677,6 +744,8 @@ with tab_backtest:
                 'CAGR %': cagr,
                 'Max DD %': max_dd_pct,
                 'Max DD ₹': max_dd_rs,
+                'Realized DD %': max_real_dd_pct,
+                'Realized DD ₹': max_real_dd_rs,
                 'Total Trades': total_trades,
                 'Win Rate %': win_rate,
                 'Wins': wins,
@@ -700,10 +769,11 @@ with tab_backtest:
                 'params': {
                     'init_capital': init_capital, 'start_date': str(start_date), 'end_date': str(end_date),
                     'sma_period': sma_period, 'mr_threshold_pct': mr_threshold_pct, 'hold_period': hold_period,
-                    'alloc_pct': alloc_pct, 'max_positions': max_positions, 'fees_pct': fees_pct, 'slippage_pct': slippage_pct,
+                    'leverage': leverage, 'alloc_pct': alloc_pct, 'max_positions': max_positions, 'fees_pct': fees_pct, 'slippage_pct': slippage_pct,
                     'use_initial_sl': use_initial_sl, 'initial_sl_pct': initial_sl_pct,
                     'enabled_stages': enabled_stages, 'min_simul_signals': min_simul_signals, 'skip_friday': skip_friday_entries,
-                    'min_market_cap': min_market_cap
+                    'min_market_cap': min_market_cap, 'min_red_days': min_red_days, 'min_vol_surge': min_vol_surge, 'vol_sma_days': vol_sma_days, 'max_rsi14': max_rsi14,
+                    'min_body_pct': min_body_pct, 'min_range_pct': min_range_pct
                 }
             }
 
@@ -746,9 +816,14 @@ with tab_backtest:
                     <div style="font-size: 24px; color: #c9d1d9; font-weight: bold;">{kpis['CAGR %']:.2f}%</div>
                 </div>
                 <div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; flex: 1; min-width: 150px;">
-                    <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">Max Drawdown</div>
+                    <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">MTM Drawdown</div>
                     <div style="font-size: 24px; color: #ff7b72; font-weight: bold;">{kpis['Max DD %']:.2f}%</div>
                     <div style="font-size: 12px; color: #8b949e; margin-top: 5px;">₹-{kpis['Max DD ₹']:,.2f}</div>
+                </div>
+                <div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; flex: 1; min-width: 150px;">
+                    <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">Realized Drawdown</div>
+                    <div style="font-size: 24px; color: #d2a8ff; font-weight: bold;">{kpis['Realized DD %']:.2f}%</div>
+                    <div style="font-size: 12px; color: #8b949e; margin-top: 5px;">₹-{kpis['Realized DD ₹']:,.2f}</div>
                 </div>
                 <div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; flex: 1; min-width: 150px;">
                     <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">Win Rate</div>
@@ -973,4 +1048,6 @@ with tab_compare:
             
             # Bar chart comparison
             st.plotly_chart(px.bar(df_compare, x='Run ID', y='CAGR %', title="CAGR % Comparison", color='Run ID'))
-            st.plotly_chart(px.bar(df_compare, x='Run ID', y='Max DD %', title="Max Drawdown % Comparison", color='Run ID'))
+            st.plotly_chart(px.bar(df_compare, x='Run ID', y='Max DD %', title="Max MTM Drawdown % Comparison", color='Run ID'))
+            if 'Realized DD %' in df_compare.columns:
+                st.plotly_chart(px.bar(df_compare, x='Run ID', y='Realized DD %', title="Max Realized Drawdown % Comparison", color='Run ID'))

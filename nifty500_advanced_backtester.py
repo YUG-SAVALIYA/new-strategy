@@ -268,9 +268,9 @@ if st.button("Run Portfolio Simulation", type="primary"):
     elif tm_mode == "The 1/3rds Scaler (8%, 15%, 25%)": max_t = 24.9
     else: max_t = 19.9
     
-    total_winners = len(df_agg[df_agg['Return %'] > 0])
+    total_trades = len(df_agg)
     full_target_hits = len(df_agg[df_agg['Max Return'] >= max_t])
-    full_target_rate = (full_target_hits / total_winners) * 100 if total_winners > 0 else 0
+    full_target_rate = (full_target_hits / total_trades) * 100 if total_trades > 0 else 0
     
     avg_ret_all = df_agg['Return %'].mean() if len(df_agg) > 0 else 0
     
@@ -309,7 +309,7 @@ if st.button("Run Portfolio Simulation", type="primary"):
             <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">Avg Portfolio Growth</div>
             <div style="font-size: 24px; color: #3fb950; font-weight: bold;">+{(avg_ret_all * 0.20):.2f}%</div>
         </div>
-        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; flex: 1; min-width: 150px;" title="Of all winning trades, this % reached the final target">
+        <div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; flex: 1; min-width: 150px;" title="Of all trades taken, this % reached the final target">
             <div style="font-size: 12px; color: #8b949e; text-transform: uppercase; font-weight: bold; margin-bottom: 5px;">Hit Full Target</div>
             <div style="font-size: 24px; color: #d2a8ff; font-weight: bold;">{full_target_rate:.1f}%</div>
         </div>
